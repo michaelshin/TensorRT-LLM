@@ -122,6 +122,13 @@ class BaseLLM:
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
+        # Track initialization timing
+        _init_start_time = time.time()
+        logger.info("=" * 80)
+        logger.info("Starting LLM initialization")
+        logger.info(f"Model: {model}")
+        logger.info("=" * 80)
+
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._llm_id = None
 
@@ -163,6 +170,9 @@ class BaseLLM:
                 revision=revision,
                 tokenizer_revision=tokenizer_revision,
                 **kwargs)
+            
+            _args_elapsed = time.time() - _init_start_time
+            logger.info(f"LLM args parsing completed in {_args_elapsed:.2f} seconds")
 
         except Exception as e:
             logger.error(
@@ -177,6 +187,7 @@ class BaseLLM:
         self.mpi_session = self.args.mpi_session
 
         if self.args.parallel_config.is_multi_gpu:
+            _mpi_start_time = time.time()
             if get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(
@@ -198,6 +209,9 @@ class BaseLLM:
                                         "yellow")
                     self.mpi_session = create_mpi_comm_session(
                         self.args.parallel_config.world_size)
+            
+            _mpi_elapsed = time.time() - _mpi_start_time
+            logger.info(f"MPI session setup completed in {_mpi_elapsed:.2f} seconds")
 
         try:
             # Due to the Executor can only accept a engine path, we need to save the engine to a directory
@@ -214,7 +228,16 @@ class BaseLLM:
             self.runtime_context: Optional[_ModelRuntimeContext] = None
             self.llm_build_stats = LlmBuildStats()
 
+            logger.info("Starting model building phase...")
+            _build_start_time = time.time()
             self._build_model()
+            _build_elapsed = time.time() - _build_start_time
+            logger.info(f"Model building completed in {_build_elapsed:.2f} seconds")
+            
+            _total_elapsed = time.time() - _init_start_time
+            logger.info("=" * 80)
+            logger.info(f"LLM initialization complete in {_total_elapsed:.2f} seconds")
+            logger.info("=" * 80)
 
         except Exception:
             if self.mpi_session is not None:
@@ -794,22 +817,42 @@ class _TrtLLM(BaseLLM):
                 shutil.copy(file, target_engine_dir / file.name)
 
     def _build_model(self):
+        logger.info("Starting TensorRT backend model building...")
+        _trt_build_start = time.time()
+        
+        logger.info("Calling base model loader...")
+        _base_build_start = time.time()
         super()._build_model()
+        _base_build_elapsed = time.time() - _base_build_start
+        logger.info(f"Base model building completed in {_base_build_elapsed:.2f} seconds")
+        
         # update the model_dir to a local dir for the runtime, such as tokenizer loading.
         if self._engine_dir is not None:
             self.args.model = self._engine_dir
 
         # Tokenizer loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
+        logger.info("Loading tokenizer and model configs...")
+        _tokenizer_start = time.time()
         self._tokenizer = self._try_load_tokenizer()
+        _tokenizer_elapsed = time.time() - _tokenizer_start
+        logger.info(f"Tokenizer and configs loaded in {_tokenizer_elapsed:.2f} seconds")
 
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
+        logger.info("Creating input processor...")
+        _input_proc_start = time.time()
         self.input_processor = create_input_processor(self._hf_model_dir,
                                                       self.tokenizer)
         self._tokenizer = self.input_processor.tokenizer
+        _input_proc_elapsed = time.time() - _input_proc_start
+        logger.info(f"Input processor created in {_input_proc_elapsed:.2f} seconds")
 
+        logger.info("Setting up executor configuration...")
+        _executor_config_start = time.time()
+        
+        logger.info("Determining batch size, token count, and sequence length limits...")
         max_batch_size = self.args.max_batch_size
         max_num_tokens = self.args.max_num_tokens
         max_seq_len = self.args.max_seq_len
@@ -819,7 +862,13 @@ class _TrtLLM(BaseLLM):
         max_batch_size = max_batch_size or build_config.max_batch_size
         max_num_tokens = max_num_tokens or build_config.max_num_tokens
         max_seq_len = max_seq_len or build_config.max_seq_len
+        
+        logger.info(f"Configuration parameters: max_batch_size={max_batch_size}, max_num_tokens={max_num_tokens}, max_seq_len={max_seq_len}")
+        logger.info(f"Max beam width: {self.args.max_beam_width}")
+        logger.info(f"Batching type: {self.args.batching_type}")
+        logger.info(f"Gather generation logits: {self.args.gather_generation_logits}")
 
+        logger.info("Creating executor config object...")
         self._executor_config = tllm.ExecutorConfig(
             max_beam_width=self.args.max_beam_width,
             scheduler_config=PybindMirror.maybe_to_pybind(
@@ -833,26 +882,37 @@ class _TrtLLM(BaseLLM):
                 self.args, 'fail_fast_on_attention_window_too_large', False))
 
         # also set executor_config.max_seq_len in TRT workflow, to deduce default max_tokens
+        logger.info("Setting max sequence length...")
         if max_seq_len is not None:
             self._executor_config.max_seq_len = max_seq_len
         else:
+            logger.info("Loading engine config to determine max_seq_len...")
             engine_config = EngineConfig.from_json_file(self._engine_dir /
                                                         "config.json")
             self._executor_config.max_seq_len = engine_config.build_config.max_seq_len
+        logger.info(f"Max sequence length set to: {self._executor_config.max_seq_len}")
 
+        logger.info("Configuring KV cache...")
         if self.args.kv_cache_config is not None:
             self._executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.kv_cache_config)
+            logger.info("KV cache configuration applied")
         if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
+            logger.info("FORCE_DETERMINISTIC mode enabled, disabling KV cache reuse")
             # Disable KV cache reuse for deterministic mode
             self._executor_config.kv_cache_config.enable_block_reuse = False
             self._executor_config.kv_cache_config.enable_partial_reuse = False
+        
+        logger.info("Configuring PEFT cache...")
         if self.args.peft_cache_config is not None:
             self._executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.peft_cache_config)
+            logger.info("PEFT cache configuration applied")
 
+        logger.info("Configuring LoRA settings...")
         lora_config = None
         if self.args.build_config.plugin_config.lora_plugin:
+            logger.info("LoRA plugin enabled, loading LoRA configuration...")
             engine_config = EngineConfig.from_json_file(self._engine_dir /
                                                         "config.json")
             lora_config = engine_config.build_config.lora_config
@@ -865,7 +925,11 @@ class _TrtLLM(BaseLLM):
             max_lora_rank = lora_config.max_lora_rank
             num_lora_modules = engine_config.pretrained_config.num_hidden_layers * \
                 len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
+            
+            logger.info(f"LoRA parameters: max_rank={max_lora_rank}, num_modules={num_lora_modules}")
+            logger.info(f"Max LoRAs: device={lora_config.max_loras}, CPU={lora_config.max_cpu_loras}")
 
+            logger.info("Calculating PEFT cache size for LoRA...")
             peft_cache_config_model = PeftCacheConfig.from_pybind(
                 self._executor_config.peft_cache_config
             ) if self._executor_config.peft_cache_config is not None else PeftCacheConfig(
@@ -873,38 +937,59 @@ class _TrtLLM(BaseLLM):
             if lora_config.max_loras is not None:
                 peft_cache_config_model.num_device_module_layer = \
                     max_lora_rank * num_lora_modules * lora_config.max_loras
+                logger.info(f"Device PEFT cache size: {peft_cache_config_model.num_device_module_layer}")
             if lora_config.max_cpu_loras is not None:
                 peft_cache_config_model.num_host_module_layer = \
                     max_lora_rank * num_lora_modules * lora_config.max_cpu_loras
+                logger.info(f"Host PEFT cache size: {peft_cache_config_model.num_host_module_layer}")
             self._executor_config.peft_cache_config = peft_cache_config_model._to_pybind(
             )
+            logger.info("LoRA configuration completed")
 
+        logger.info("Configuring decoding settings...")
         if self.args.decoding_config is not None:
             self._executor_config.decoding_config = self.args.decoding_config
+            logger.info("Decoding configuration applied")
         if self.args.guided_decoding_backend == 'xgrammar':
+            logger.info("Configuring xgrammar guided decoding...")
             self._executor_config.guided_decoding_config = tllm.GuidedDecodingConfig(
                 backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.
                 XGRAMMAR,
                 **_xgrammar_tokenizer_info(self.tokenizer))
+            logger.info("Xgrammar guided decoding configured")
         elif self.args.guided_decoding_backend is not None:
             raise ValueError(
                 f"Unsupported guided decoding backend {self.args.guided_decoding_backend}"
             )
 
+        logger.info("Applying final executor configuration settings...")
         self._executor_config.normalize_log_probs = self.args.normalize_log_probs
         self._executor_config.enable_chunked_context = self.args.enable_chunked_prefill
         self._executor_config.max_beam_width = self.args.max_beam_width or self.args.build_config.max_beam_width
+        logger.info(f"Normalize log probs: {self.args.normalize_log_probs}")
+        logger.info(f"Enable chunked prefill: {self.args.enable_chunked_prefill}")
+        
         if self.args.extended_runtime_perf_knob_config is not None:
+            logger.info("Applying extended runtime performance knobs...")
             self._executor_config.extended_runtime_perf_knob_config = PybindMirror.maybe_to_pybind(
                 self.args.extended_runtime_perf_knob_config)
         if self.args.cache_transceiver_config is not None:
+            logger.info("Configuring cache transceiver...")
             self._executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
                 self.args.cache_transceiver_config)
+        
+        logger.info("Setting parallel configuration...")
         self._executor_config.llm_parallel_config = self.args.parallel_config
         return_logits = (self.args.gather_generation_logits
                          or (self.args.build_config
                              and self.args.build_config.gather_context_logits))
+        logger.info(f"Return logits: {return_logits}")
+        
+        _executor_config_elapsed = time.time() - _executor_config_start
+        logger.info(f"Executor configuration setup completed in {_executor_config_elapsed:.2f} seconds")
 
+        logger.info("Creating executor...")
+        _executor_create_start = time.time()
         self._executor = self._executor_cls.create(
             self._engine_dir,
             executor_config=self._executor_config,
@@ -920,6 +1005,11 @@ class _TrtLLM(BaseLLM):
             ),
             is_llm_executor=True,
             lora_config=lora_config)
+        _executor_create_elapsed = time.time() - _executor_create_start
+        logger.info(f"Executor created in {_executor_create_elapsed:.2f} seconds")
+        
+        _trt_build_elapsed = time.time() - _trt_build_start
+        logger.info(f"TensorRT backend model building completed in {_trt_build_elapsed:.2f} seconds")
 
 
 @append_docstring(TORCH_LLM_DOCSTRING)
@@ -961,22 +1051,45 @@ class _TorchLLM(BaseLLM):
                          **kwargs)
 
     def _build_model(self):
+        logger.info("Starting PyTorch backend model building...")
+        _torch_build_start = time.time()
+        
+        logger.info("Calling base model loader...")
+        _base_build_start = time.time()
         super()._build_model()
+        _base_build_elapsed = time.time() - _base_build_start
+        logger.info(f"Base model building completed in {_base_build_elapsed:.2f} seconds")
+        
         assert self._engine_dir is None
 
         # Tokenizer loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
+        logger.info("Loading tokenizer and model configs...")
+        _tokenizer_start = time.time()
         self._tokenizer = self._try_load_tokenizer()
+        _tokenizer_elapsed = time.time() - _tokenizer_start
+        logger.info(f"Tokenizer and configs loaded in {_tokenizer_elapsed:.2f} seconds")
 
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
+        logger.info("Creating input processor...")
+        _input_proc_start = time.time()
         self.input_processor = create_input_processor(self._hf_model_dir,
                                                       self.tokenizer)
         self._tokenizer = self.input_processor.tokenizer
+        _input_proc_elapsed = time.time() - _input_proc_start
+        logger.info(f"Input processor created in {_input_proc_elapsed:.2f} seconds")
 
         # TODO: revisit gather_context_logits
+        logger.info("Setting up PyTorch executor configuration...")
         return_logits = self.args.gather_generation_logits
+        logger.info(f"Return logits: {return_logits}")
+        logger.info(f"Model world size: {self.args.parallel_config.world_size}")
+        logger.info(f"Number of postprocess workers: {self.args.num_postprocess_workers}")
+        
+        logger.info("Creating PyTorch executor...")
+        _executor_create_start = time.time()
         self._executor = self._executor_cls.create(
             self._engine_dir,
             executor_config=None,
@@ -997,6 +1110,11 @@ class _TorchLLM(BaseLLM):
             hf_model_dir=self._hf_model_dir,
             tokenizer=self.tokenizer,
             llm_args=self.args)
+        _executor_create_elapsed = time.time() - _executor_create_start
+        logger.info(f"PyTorch executor created in {_executor_create_elapsed:.2f} seconds")
+        
+        _torch_build_elapsed = time.time() - _torch_build_start
+        logger.info(f"PyTorch backend model building completed in {_torch_build_elapsed:.2f} seconds")
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """Validate that users don't pass TrtLlmArgs-specific arguments when using PyTorch backend.

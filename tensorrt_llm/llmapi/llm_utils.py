@@ -316,6 +316,9 @@ class ModelLoader:
 
     def _download_hf_model(self):
         ''' Download HF model from third-party model hub like www.modelscope.cn or huggingface.  '''
+        logger.info(f"Starting HF model download for: {self.model_obj.model_name}")
+        _download_start = time.time()
+        
         model_dir = None
         speculative_model_dir = None
         # Only the rank0 are allowed to download model
@@ -324,15 +327,23 @@ class ModelLoader:
             assert isinstance(self.model_obj.model_name, str)
             # this will download only once when multiple MPI processes are running
 
+            logger.info("Downloading main model files...")
             model_dir = download_hf_model(self.model_obj.model_name,
                                           revision=self.llm_args.revision)
             print_colored(f"Downloaded model to {model_dir}\n", 'grey')
+            logger.info(f"Main model downloaded to: {model_dir}")
+            
             if self.speculative_model_obj:
+                logger.info("Downloading speculative model files...")
                 speculative_model_dir = download_hf_model(
                     self.speculative_model_obj.model_name)
                 print_colored(f"Downloaded model to {speculative_model_dir}\n",
                               'grey')
+                logger.info(f"Speculative model downloaded to: {speculative_model_dir}")
+        
         # Make all the processes got the same model_dir
+        logger.info("Broadcasting model directory to all ranks...")
+        _broadcast_start = time.time()
         self._model_dir = mpi_broadcast(model_dir, root=0)
         self.model_obj.model_dir = self._model_dir  # mark as a local model
         assert self.model_obj.is_local_model
@@ -342,6 +353,12 @@ class ModelLoader:
             self.speculative_model_obj.model_dir = self._speculative_model_dir
 
             assert self.speculative_model_obj.is_local_model
+        
+        _broadcast_elapsed = time.time() - _broadcast_start
+        logger.info(f"Model directory broadcast completed in {_broadcast_elapsed:.2f} seconds")
+        
+        _download_elapsed = time.time() - _download_start
+        logger.info(f"HF model download completed in {_download_elapsed:.2f} seconds")
 
     def _update_from_hf_quant_config(self) -> bool:
         """Update quant_config from the config file of pre-quantized HF checkpoint.
@@ -445,21 +462,35 @@ class ModelLoader:
 
     def _load_model_from_hf(self):
         ''' Load a TRT-LLM model from a HF model. '''
+        logger.info("Starting HF model loading to memory...")
+        _load_start = time.time()
+        
         assert self._model_dir is not None
+        logger.info(f"Loading model from directory: {self._model_dir}")
 
+        logger.info("Getting model class for architecture...")
+        _model_cls_start = time.time()
         model_cls = AutoModelForCausalLM.get_trtllm_model_class(
             self._model_dir, self.llm_args.trust_remote_code,
             self.llm_args.decoding_config.decoding_mode
             if hasattr(self.llm_args, "speculative_model_dir")
             and self.llm_args.speculative_model_dir else None)
+        _model_cls_elapsed = time.time() - _model_cls_start
+        logger.info(f"Model class retrieval completed in {_model_cls_elapsed:.2f} seconds")
 
+        logger.info("Checking quantization configuration...")
+        _quant_check_start = time.time()
         prequantized = self._update_from_hf_quant_config()
+        _quant_check_elapsed = time.time() - _quant_check_start
+        logger.info(f"Quantization config check completed in {_quant_check_elapsed:.2f} seconds (prequantized={prequantized})")
 
         # FP4 Gemm force to use plugin.
         if self.llm_args.quant_config.quant_mode.has_nvfp4():
+            logger.info("Enabling nvfp4 gemm plugin for FP4 quantization")
             self.llm_args.build_config.plugin_config.gemm_plugin = "nvfp4"
 
         if self.llm_args.load_format == 'dummy':
+            logger.info("Loading model in dummy mode (no weights)...")
             config = model_cls.config_class.from_hugging_face(
                 str(self._model_dir),
                 dtype=self.llm_args.dtype,
@@ -468,10 +499,14 @@ class ModelLoader:
                 **self.convert_checkpoint_options,
             )
             self.model = model_cls(config)
+            logger.info("Dummy model created successfully")
         elif self.llm_args.quant_config._requires_calibration and not prequantized:
+            logger.info("Model requires calibration for quantization...")
             assert self.workspace is not None
             checkpoint_dir = f"{self.workspace}/quantized-checkpoint"
             if self.rank == 0:
+                logger.info(f"Rank 0 performing quantization to {checkpoint_dir}...")
+                _quantize_start = time.time()
                 model_cls.quantize(
                     self._model_dir,
                     checkpoint_dir,
@@ -481,11 +516,20 @@ class ModelLoader:
                     **self.llm_args.calib_config.to_dict(),
                     trust_remote_code=self.llm_args.trust_remote_code,
                 )
+                _quantize_elapsed = time.time() - _quantize_start
+                logger.info(f"Quantization completed in {_quantize_elapsed:.2f} seconds")
             if self.llm_args.parallel_config.is_multi_gpu:
+                logger.info("Synchronizing ranks after quantization...")
                 mpi_barrier()
+            logger.info(f"Loading quantized checkpoint from {checkpoint_dir}...")
+            _checkpoint_load_start = time.time()
             self.model = model_cls.from_checkpoint(checkpoint_dir,
                                                    rank=self.mapping.rank)
+            _checkpoint_load_elapsed = time.time() - _checkpoint_load_start
+            logger.info(f"Quantized checkpoint loaded in {_checkpoint_load_elapsed:.2f} seconds")
         else:
+            logger.info(f"Loading HF model weights (dtype={self.llm_args.dtype})...")
+            _weights_load_start = time.time()
             self.model = model_cls.from_hugging_face(
                 str(self._model_dir),
                 dtype=self.llm_args.dtype,
@@ -500,34 +544,58 @@ class ModelLoader:
                                   LookaheadDecodingConfig) else None,
                 **self.convert_checkpoint_options,
             )
+            _weights_load_elapsed = time.time() - _weights_load_start
+            logger.info(f"HF model weights loaded in {_weights_load_elapsed:.2f} seconds")
 
         self.pretrained_config = self.model.config
         self._model_info = _ModelInfo.from_pretrained_config(
             self.pretrained_config)
+        
+        _load_elapsed = time.time() - _load_start
+        logger.info(f"HF model loading completed in {_load_elapsed:.2f} seconds")
 
     @print_traceback_on_error
     def _load_model_from_ckpt(self):
         ''' Load a TRT-LLM model from checkpoint. '''
+        logger.info("Starting TRT-LLM checkpoint loading...")
+        _ckpt_load_start = time.time()
+        
+        logger.info(f"Loading pretrained config from: {self._model_dir}/config.json")
+        _config_start = time.time()
         self.pretrained_config = PretrainedConfig.from_json_file(
             os.path.join(self._model_dir, 'config.json'))
         self.pretrained_config.mapping = self.mapping
+        _config_elapsed = time.time() - _config_start
+        logger.info(f"Pretrained config loaded in {_config_elapsed:.2f} seconds")
 
         #TODO: TRTLLM-1091, change the architecture in the checkpoint to TRT-LLM one, not HF one.
         architecture = self.pretrained_config.architecture
+        logger.info(f"Model architecture: {architecture}")
         assert architecture in MODEL_MAP, \
             f"Unsupported model architecture: {architecture}"
         model_cls = MODEL_MAP[architecture]
+        
         if self.llm_args.load_format == 'dummy':
+            logger.info("Creating model in dummy mode (no weights)...")
             self.model = model_cls(self.pretrained_config)
+            logger.info("Dummy model created successfully")
         else:
+            logger.info(f"Loading checkpoint weights from: {self._model_dir}")
+            _weights_start = time.time()
             self.model = model_cls.from_checkpoint(
                 self._model_dir, config=self.pretrained_config)
+            _weights_elapsed = time.time() - _weights_start
+            logger.info(f"Checkpoint weights loaded in {_weights_elapsed:.2f} seconds")
+        
         self._model_info = _ModelInfo.from_pretrained_config(
             self.pretrained_config)
 
         # load parallel embedding related options
         self.convert_checkpoint_options[
             'use_parallel_embedding'] = self.pretrained_config.use_parallel_embedding
+        
+        _ckpt_load_elapsed = time.time() - _ckpt_load_start
+        logger.info(f"TRT-LLM checkpoint loading completed in {_ckpt_load_elapsed:.2f} seconds")
 
     def _build_engine_from_inmemory_model(self):
         assert isinstance(self.llm_args.model, Module)
@@ -535,6 +603,9 @@ class ModelLoader:
 
     @print_traceback_on_error
     def _build_engine(self):
+        logger.info(f"Starting TensorRT engine compilation (rank {mpi_rank()})...")
+        _build_start = time.time()
+        
         assert isinstance(
             self.build_config,
             BuildConfig), f"build_config is not set yet: {self.build_config}"
@@ -542,6 +613,8 @@ class ModelLoader:
         print_colored_debug(f"rank{mpi_rank()} begin to build engine...\n",
                             "green")
 
+        logger.info("Preparing build configuration...")
+        _config_prep_start = time.time()
         # avoid the original build_config is modified, avoid the side effect
         copied_build_config = copy.deepcopy(self.build_config)
 
@@ -549,15 +622,31 @@ class ModelLoader:
             auto_parallel_config=self.auto_parallel_config)
         copied_build_config.update_kv_cache_type(self._model_info.architecture)
         if self.auto_parallel_config.enabled:
+            logger.info("Auto parallel enabled, updating rank mapping...")
             self.model.config.mapping.rank = self.rank
         assert self.model is not None, "model is loaded yet."
+        _config_prep_elapsed = time.time() - _config_prep_start
+        logger.info(f"Build configuration prepared in {_config_prep_elapsed:.2f} seconds")
 
+        logger.info("Compiling TensorRT engine (this may take several minutes)...")
+        _compile_start = time.time()
         self._engine = build(self.model, copied_build_config)
+        _compile_elapsed = time.time() - _compile_start
+        logger.info(f"TensorRT engine compilation completed in {_compile_elapsed:.2f} seconds")
+        
         self.mapping = self.model.config.mapping
 
         # delete the model explicitly to free all the build-time resources
+        logger.info("Releasing model memory...")
+        _cleanup_start = time.time()
         self.model = None
+        _cleanup_elapsed = time.time() - _cleanup_start
+        logger.info(f"Model memory released in {_cleanup_elapsed:.2f} seconds")
+        
         print_colored_debug(f"rank{mpi_rank()} build engine done\n", "green")
+        
+        _build_elapsed = time.time() - _build_start
+        logger.info(f"TensorRT engine build completed in {_build_elapsed:.2f} seconds")
 
     def _save_engine_for_runtime(self):
         '''
@@ -617,11 +706,17 @@ class CachedModelLoader:
                 self._workspace)
 
     def __call__(self) -> Tuple[Path, Union[Path, None]]:
+        logger.info("Starting CachedModelLoader execution...")
+        _loader_start_time = time.time()
 
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
+            logger.info(f"Using existing TensorRT-LLM engine: {self.llm_args.model}")
+            _loader_elapsed = time.time() - _loader_start_time
+            logger.info(f"Model loader completed in {_loader_elapsed:.2f} seconds")
             return Path(self.llm_args.model), None
 
         if self.llm_args.backend == "_autodeploy":
+            logger.info("Using AutoDeploy backend")
             return None, ""
 
         self.engine_cache_stage: Optional[CachedStage] = None
@@ -636,10 +731,15 @@ class CachedModelLoader:
                     f'backend {self.llm_args.backend} is not supported.')
 
             if self.model_loader.model_obj.is_hub_model:
+                logger.info(f"Downloading HF model: {self.model_loader.model_obj.model_name}")
+                _download_start = time.time()
                 self._hf_model_dir = download_hf_model(
                     self.model_loader.model_obj.model_name,
                     self.llm_args.revision)
+                _download_elapsed = time.time() - _download_start
+                logger.info(f"HF model downloaded in {_download_elapsed:.2f} seconds")
             else:
+                logger.info(f"Using local model directory: {self.model_loader.model_obj.model_dir}")
                 self._hf_model_dir = self.model_loader.model_obj.model_dir
 
             if self.llm_args.quant_config.quant_algo is not None:
@@ -650,16 +750,20 @@ class CachedModelLoader:
             # TODO: Unify the logics with those in tensorrt_llm/_torch/model_config.py
             self.model_loader._update_from_hf_quant_config()
 
+            _loader_elapsed = time.time() - _loader_start_time
+            logger.info(f"Model loader completed in {_loader_elapsed:.2f} seconds")
             return None, self._hf_model_dir
 
         if self.model_loader.model_obj.is_hub_model:
             # This will download the config.json from HF model hub, this helps to create a PretrainedConfig for
             # cache key.
+            logger.info("Downloading HF pretrained config for cache key...")
             self._hf_model_dir = download_hf_pretrained_config(
                 self.model_loader.model_obj.model_name,
                 revision=self.llm_args.revision)
 
         elif self.model_loader.model_obj.is_local_model:
+            logger.info(f"Using local model for TensorRT backend: {self.model_loader.model_obj.model_dir}")
             self._hf_model_dir = self.model_loader.model_obj.model_dir if self.llm_args.model_format is _ModelFormatKind.HF else None
 
         if self.build_cache_enabled:
@@ -668,15 +772,28 @@ class CachedModelLoader:
             self.engine_cache_stage = self._get_engine_cache_stage()
             if self.engine_cache_stage.is_cached():
                 self.llm_build_stats.cache_hitted = True
+                logger.info(f"Cache HIT: Reusing cached engine from {self.engine_cache_stage.get_engine_path()}")
                 print_colored(
                     f"Reusing cached engine in {self.engine_cache_stage.get_engine_path()}\n\n",
                     'grey')
                 self.model_loader.model_obj.model_dir = self.engine_cache_stage.get_engine_path(
                 )
                 self.llm_build_stats.engine_dir = self.model_loader.model_obj.model_dir
+                _loader_elapsed = time.time() - _loader_start_time
+                logger.info(f"Model loader completed (cache hit) in {_loader_elapsed:.2f} seconds")
                 return self.llm_build_stats.engine_dir, self._hf_model_dir
+            else:
+                logger.info("Cache MISS: Building model from scratch...")
 
-        return self._build_model(), self._hf_model_dir
+        logger.info("Building model...")
+        _build_start = time.time()
+        result = self._build_model(), self._hf_model_dir
+        _build_elapsed = time.time() - _build_start
+        logger.info(f"Model build completed in {_build_elapsed:.2f} seconds")
+        
+        _loader_elapsed = time.time() - _loader_start_time
+        logger.info(f"Model loader completed in {_loader_elapsed:.2f} seconds")
+        return result
 
     def get_engine_dir(self) -> Path:
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
@@ -739,10 +856,14 @@ class CachedModelLoader:
             trust_remote_code=self.llm_args.trust_remote_code)
 
     def _build_model(self) -> Path:
+        logger.info("Starting distributed model build task...")
+        _dist_build_start = time.time()
+        
         model_format = self.llm_args.model_format
 
         def build_task(engine_dir: Path):
             if model_format is not _ModelFormatKind.TLLM_ENGINE:
+                logger.info(f"Setting up model loader (engine_dir: {engine_dir})...")
                 model_loader_kwargs = {
                     'llm_args': self.llm_args,
                     'workspace': str(self.workspace),
@@ -750,6 +871,7 @@ class CachedModelLoader:
                 }
 
                 if self.llm_args.parallel_config.is_multi_gpu:
+                    logger.info(f"Multi-GPU mode: Submitting build task to {self.llm_args.parallel_config.world_size} workers...")
                     assert self.mpi_session
 
                     #mpi_session cannot be pickled so remove from self.llm_args
@@ -757,16 +879,24 @@ class CachedModelLoader:
                         del self.llm_args.mpi_session
 
                     # The engine_dir:Path will be stored to MPINodeState.state
+                    _worker_submit_start = time.time()
                     build_infos = self.mpi_session.submit_sync(
                         CachedModelLoader._node_build_task,
                         engine_dir=engine_dir,
                         **model_loader_kwargs)
+                    _worker_submit_elapsed = time.time() - _worker_submit_start
+                    logger.info(f"Worker build tasks completed in {_worker_submit_elapsed:.2f} seconds")
                     self.llm_build_stats.build_steps_info = build_infos[0]
 
                 else:  # single-gpu
+                    logger.info("Single-GPU mode: Building model locally...")
+                    _single_build_start = time.time()
                     with ModelLoader(**model_loader_kwargs) as model_loader:
                         model_loader(engine_dir=engine_dir)
+                    _single_build_elapsed = time.time() - _single_build_start
+                    logger.info(f"Single-GPU build completed in {_single_build_elapsed:.2f} seconds")
 
+                logger.info("Releasing garbage collection...")
                 release_gc()
 
         has_storage = True
@@ -813,6 +943,9 @@ class CachedModelLoader:
         if not (has_storage and self.build_cache_enabled):
             build_task(self.get_engine_dir())
 
+        _dist_build_elapsed = time.time() - _dist_build_start
+        logger.info(f"Distributed model build task completed in {_dist_build_elapsed:.2f} seconds")
+        
         return self.get_engine_dir()
 
     @print_traceback_on_error

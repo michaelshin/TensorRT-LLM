@@ -132,11 +132,17 @@ class MpiSession(abc.ABC):
 class MpiPoolSession(MpiSession):
 
     def __init__(self, n_workers: int):
+        logger.info(f"Initializing MpiPoolSession with {n_workers} workers...")
+        _init_start = time.time()
+        
         self.n_workers = n_workers
         self.mpi_pool: Optional[MPIPoolExecutor] = None
         self._start_mpi_pool()
         if ENABLE_MULTI_DEVICE:
             self.comm = mpi4py.MPI.COMM_WORLD
+        
+        _init_elapsed = time.time() - _init_start
+        logger.info(f"MpiPoolSession initialized in {_init_elapsed:.2f} seconds")
 
     def get_comm(self):
         return self.comm
@@ -164,10 +170,16 @@ class MpiPoolSession(MpiSession):
         self.get_comm().Abort(1)
 
     def _start_mpi_pool(self):
+        logger.info(f"Starting MPI pool with {self.n_workers} workers...")
+        _pool_start = time.time()
+        
         assert not self.mpi_pool, 'MPI session already started'
 
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path)
+        
+        _pool_elapsed = time.time() - _pool_start
+        logger.info(f"MPI pool started in {_pool_elapsed:.2f} seconds")
 
     def __del__(self):
         self.shutdown_abort()
@@ -179,6 +191,9 @@ class MpiPoolSession(MpiSession):
 class MpiCommSession(MpiSession):
 
     def __init__(self, comm=None, n_workers: int = 1):
+        logger.info(f"Initializing MpiCommSession with {n_workers} workers...")
+        _init_start = time.time()
+        
         self.comm = comm
         self.n_workers = n_workers
         self.thread_pool: Optional[ThreadPoolExecutor] = None
@@ -190,6 +205,7 @@ class MpiCommSession(MpiSession):
 
         if ENABLE_MULTI_DEVICE:
             if not self.comm:
+                logger.info("Using MPI COMM_WORLD...")
                 self.comm = mpi4py.MPI.COMM_WORLD
 
             if self.comm.Get_rank() != 0:
@@ -203,6 +219,9 @@ class MpiCommSession(MpiSession):
                 )
 
         self._start_mpi_pool()
+        
+        _init_elapsed = time.time() - _init_start
+        logger.info(f"MpiCommSession initialized in {_init_elapsed:.2f} seconds")
 
     def get_comm(self):
         return self.comm
@@ -241,11 +260,19 @@ class MpiCommSession(MpiSession):
         self.get_comm().Abort(1)
 
     def _start_mpi_pool(self):
+        logger.info("Starting MPI Comm pool...")
+        _pool_start = time.time()
+        
         assert not self.mpi_pool, 'MPI session already started'
 
+        logger.info("Creating thread pool executor...")
         self.thread_pool = ThreadPoolExecutor(max_workers=2)
+        logger.info("Creating MPI comm executor...")
         comm_executor = MPICommExecutor(self.comm)
         self.mpi_pool = comm_executor.__enter__()
+        
+        _pool_elapsed = time.time() - _pool_start
+        logger.info(f"MPI Comm pool started in {_pool_elapsed:.2f} seconds")
 
     def __del__(self):
         self.shutdown_abort()
